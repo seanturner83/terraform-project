@@ -1,0 +1,165 @@
+#cloud-config
+repo_update: true
+repo_upgrade: all
+
+preserve_hostname: true
+
+users:
+- default
+
+write_files:
+- path: /etc/systemd/system/attach-ebs-volume.service
+  permissions: '0644'
+  content: |
+    [Unit]
+    Description=Attach EBS volume if needed
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    ExecStart=/bin/bash -c ' \
+      test -e /dev/nvme1n1 && exit 0; \
+      export region=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq .region -r); \
+      export availability_zone=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq .availabilityZone -r); \
+      export volume_id=$(aws ec2 describe-volumes --filters Name=tag-key,Values="Attach" Name=tag-value,Values="web_local_data" --query "Volumes[?AvailabilityZone==\`$availability_zone\`]|[?State==\`available\`].{ID:VolumeId}" --region=$region --output text); \
+      aws ec2 attach-volume --region $region --volume-id $volume_id --instance-id $(curl -sL http://169.254.169.254/latest/meta-data/instance-id) --device /dev/xvdf \
+    '
+    ExecStartPost=/bin/bash -c ' \
+        until test -e /dev/nvme1n1; do \
+        echo "Waiting for device /dev/xvdf ~= /dev/nvme1n1..."; \
+        sleep 1; \
+      done \
+    '
+    ExecStop=/bin/bash -c ' \
+      test -e /dev/nvme1n1 || exit 0; \
+      export region=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq .region -r); \
+      export instance_id=$(curl -sL http://169.254.169.254/latest/meta-data/instance-id); \
+      export volume_id=$(aws ec2 describe-volumes --filters Name=tag-key,Values="Attach" Name=tag-value,Values="web_local_data" --query "Volumes[*].Attachments[?InstanceId==\`$instance_id\`].{ID:VolumeId}" --region=$region --output text | head -1); \
+      aws ec2 detach-volume --region $region --volume-id $volume_id --instance-id $instance_id \
+    '
+
+- path: /etc/systemd/system/backup-ebs-volume.service
+  permissions: '0644'
+  content: |
+    [Unit]
+    Description=Backup attached EBS volume - maybe you need this, maybe not
+
+    [Service]
+    Type=oneshot
+    ExecStart=/bin/bash -c ' \
+      export region=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq .region -r); \
+      export instance_id=$(curl -sL http://169.254.169.254/latest/meta-data/instance-id); \
+      export volume_id=$(aws ec2 describe-volumes --filters Name=tag-key,Values="Attach" Name=tag-value,Values="web_local_data" --query "Volumes[*].Attachments[?InstanceId==\`$instance_id\`].{ID:VolumeId}" --region=$region --output text | head -1); \
+      aws ec2 create-snapshot --volume-id $volume_id --description web-local-data-$(date +%%y%%m%%d%%H%%M)-%H --region $region \
+    '
+
+- path: /etc/systemd/system/backup-ebs-volume.timer
+  permissions: '0644'
+  content: |
+    [Unit]
+    Description=Run snapshot of attached volume daily at silly o clock
+
+    [Timer]
+    OnCalendar=*-*-* 02:37:00
+    RandomizedDelaySec=300
+
+    [Install]
+    WantedBy=timers.target
+
+- path: /etc/systemd/system/ensure-ebs-volume-formatted.service
+  permissions: '0644'
+  content: |
+    [Unit]
+    Description=Format EBS volume if needed
+    After=attach-ebs-volume.service
+    Requires=attach-ebs-volume.service
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    ExecStart=/bin/bash -c 'blkid /dev/nvme1n1 || (wipefs -fa /dev/nvme1n1 && mkfs.xfs /dev/nvme1n1)'
+
+- path: /etc/systemd/system/data.mount
+  permissions: '0644'
+  content: |
+    [Unit]
+    Description=Mount local data
+    After=ensure-ebs-volume-formatted.service
+    Requires=ensure-ebs-volume-formatted.service
+
+    [Mount]
+    What=/dev/nvme1n1
+    Where=/data
+    Type=xfs
+
+- path: /etc/systemd/system/webdata.mount
+  permissions: '0644'
+  content: |
+    [Unit]
+    Description=EFS mount for webapp persistent data
+    After=network.target
+
+    [Mount]
+    What=fs-7f2eb3b6.efs.eu-west-1.amazonaws.com:/
+    Where=/webdata
+    Type=nfs4
+    Options=_netdev,nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2
+
+    [Install]
+    WantedBy=multi-user.target
+
+- path: /etc/systemd/system/webapp.service
+  permissions: '0644'
+  content: |
+    [Unit]
+    Description=Your application server
+    Requires=data.mount
+    Requires=webdata.mount
+    After=data.mount
+    After=webdata.mount
+
+    [Service]
+    User=bob
+    Group=bob
+    PermissionsStartOnly=true
+    ExecStartPre=/bin/chown -R bob:bob /data
+    ExecStartPre=/bin/chown -R bob:bob /webdata
+    ExecStartPre=/bin/mkdir -p /var/log/webapp
+    ExecStartPre=/bin/chown bob:bob /var/log/webapp
+    ExecStart=/bin/webapp
+
+    [Install]
+    WantedBy=multi-user.target
+
+- path: /etc/datadog-agent/datadog.yaml
+  permissions: '0644'
+  content: |
+    dd_url: https://app.datadoghq.com
+    api_key: <your api key>
+    tags:
+    - webapp
+    - www
+
+- path: /etc/yum.repos.d/datadog.repo
+  permissions: '0644'
+  content: |
+    [datadog]
+    name = Datadog, Inc.
+    baseurl = https://yum.datadoghq.com/stable/6/x86_64/
+    enabled=1
+    gpgcheck=1
+    priority=1
+    gpgkey=https://yum.datadoghq.com/DATADOG_RPM_KEY.public
+      https://yum.datadoghq.com/DATADOG_RPM_KEY_E09422B3.public
+
+runcmd:
+- yum -y install epel-release
+- yum -y install wget jq curl awscli
+- useradd bob -u 1234
+- yum -y install datadog-agent
+- systemctl enable webapp.service
+- systemctl enable datadog-agent
+- systemctl enable backup-ebs-volume.timer
+- systemctl start webapp.service
+- systemctl start datadog-agent
+- systemctl start backup-ebs-volume.timer
